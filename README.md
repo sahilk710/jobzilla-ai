@@ -196,4 +196,3 @@ MIT License - see [LICENSE](LICENSE) for details.
 
 ---
 
-Built with ❤️ using LangGraph, FastAPI, and Streamlit
