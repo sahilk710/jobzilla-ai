@@ -1,190 +1,123 @@
-# 🦖 Jobzilla
+# 🦖 Jobzilla AI (formerly KillMatch)
 
-> AI-powered job matching platform with multi-agent debates using LangGraph
+**The AI-Powered Job Application Assistant that helps you land your dream job.**
 
-[![CI](https://github.com/your-org/jobzilla/actions/workflows/ci.yml/badge.svg)](https://github.com/your-org/jobzilla/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+---
 
-## 🌟 Features
+## 🏗️ System Architecture
 
-- **Multi-Agent Debate System**: Recruiter vs Coach agents debate your fit for jobs
-- **MCP Server Architecture**: Model Context Protocol servers for GitHub and job market data
-- **Semantic Job Matching**: Pinecone-powered vector search with OpenAI embeddings
-- **Cover Letter Generation**: AI-generated letters informed by the debate
-- **Skill Gap Analysis**: Personalized learning roadmaps
-- **Proactive Headhunting**: Daily job matching via Airflow DAGs
+```mermaid
+graph TD
+    %% Styling
+    classDef frontend fill:#e1f5fe,stroke:#01579b,stroke-width:2px;
+    classDef backend fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px;
+    classDef ai fill:#fff3e0,stroke:#ef6c00,stroke-width:2px;
+    classDef db fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px;
+    classDef ext fill:#eceff1,stroke:#455a64,stroke-width:2px;
 
-## 🏗️ Architecture
+    %% Client Layer
+    Client[🖥️ Streamlit Frontend]:::frontend <-->|HTTP/JSON| API[🚀 FastAPI Backend]:::backend
 
+    %% Backend Services
+    subgraph "Backend Infrastructure"
+        API <-->|SQLAlchemy| DB[(🐘 PostgreSQL)]:::db
+        API <-->|Redis-py| Cache[(⚡ Redis)]:::db
+        API <-->|Vector Search| VectorDB[(🌲 Pinecone)]:::db
+    end
+
+    %% AI Logic
+    subgraph "LangGraph Agent Workflow"
+        API -->|Orchestrate| Graph[StateGraph]:::ai
+        Graph -->|Analyze| Recruiter[🔴 Recruiter Agent]:::ai
+        Graph -->|Advocate| Coach[🟢 Coach Agent]:::ai
+        Graph -->|Decide| Judge[⚖️ Judge Agent]:::ai
+        Recruiter <-->|Debate| Coach
+        Coach <-->|Debate| Judge
+    end
+
+    %% External Context
+    subgraph "Context Providers (MCP)"
+        API <-->|MCP Protocol| JobMCP[💼 Job Market MCP]:::ext
+        API <-->|MCP Protocol| GitMCP[🐙 GitHub MCP]:::ext
+    end
+    
+    JobMCP -.->|Scrape| Web[🌍 LinkedIn/Indeed]
+    GitMCP -.->|REST API| GitHub[GitHub API]
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        Streamlit Frontend                        │
-└─────────────────────────────────┬───────────────────────────────┘
-                                  │
-┌─────────────────────────────────▼───────────────────────────────┐
-│                         FastAPI Backend                          │
-│  ┌─────────────────────────────────────────────────────────┐    │
-│  │                   LangGraph Agent Pipeline               │    │
-│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌─────────┐  │    │
-│  │  │ Profile  │→ │Recruiter │→ │  Coach   │→ │  Judge  │  │    │
-│  │  │ Parser   │  │ (Critic) │  │(Advocate)│  │(Arbiter)│  │    │
-│  │  └──────────┘  └──────────┘  └──────────┘  └─────────┘  │    │
-│  └─────────────────────────────────────────────────────────┘    │
-└─────────────────────────────────┬───────────────────────────────┘
-                                  │
-        ┌─────────────────────────┼─────────────────────────┐
-        │                         │                         │
-┌───────▼───────┐         ┌───────▼───────┐         ┌───────▼───────┐
-│  MCP Server   │         │  MCP Server   │         │   Pinecone    │
-│ GitHub Context│         │  Job Market   │         │ Vector Store  │
-└───────────────┘         └───────────────┘         └───────────────┘
-```
 
-## 🚀 Quick Start
+## 💻 Technologies and Tools
 
-### Prerequisites
+![Python](https://img.shields.io/badge/Python-3776AB?style=for-the-badge&logo=python&logoColor=white)
+![Streamlit](https://img.shields.io/badge/Streamlit-FF4B4B?style=for-the-badge&logo=Streamlit&logoColor=white)
+![FastAPI](https://img.shields.io/badge/FastAPI-009688?style=for-the-badge&logo=fastapi&logoColor=white)
+![Docker](https://img.shields.io/badge/Docker-2496ED?style=for-the-badge&logo=docker&logoColor=white)
+![PostgreSQL](https://img.shields.io/badge/PostgreSQL-316192?style=for-the-badge&logo=postgresql&logoColor=white)
+![Redis](https://img.shields.io/badge/redis-%23DD0031.svg?style=for-the-badge&logo=redis&logoColor=white)
+![OpenAI](https://img.shields.io/badge/OpenAI-412991?style=for-the-badge&logo=openai&logoColor=white)
+![LangChain](https://img.shields.io/badge/LangChain-1C3C3C?style=for-the-badge&logo=langchain&logoColor=white)
 
-- Python 3.11+
-- Docker & Docker Compose
-- API Keys: OpenAI, Pinecone, GitHub Token
+## ✨ Key Features
 
-### Setup
+### 🤖 Multi-Agent Debate
+Instead of a simple "match score," three AI agents debate your candidacy:
+- **🔴 The Recruiter**: Plays devil's advocate, finding every weakness in your profile.
+- **🟢 The Career Coach**: Advocates for you, highlighting transferable skills and potential.
+- **⚖️ The Judge**: Weighs both sides and gives a final, unbiased verdict.
 
-1. **Clone and configure**
-   ```bash
-   git clone https://github.com/your-org/jobzilla.git
-   cd jobzilla
-   cp .env.example .env
-   # Edit .env with your API keys
-   ```
+### 🔍 Semantic Job Search
+Forget keyword matching. Jobzilla uses **Vector Embeddings (OpenAI)** to understand the *meaning* of your resume and finds jobs that match your actual skills, not just keywords.
 
-2. **Start all services**
-   ```bash
-   make up
-   # or
-   docker-compose up -d
-   ```
+### 📝 Intelligent Cover Letters
+Generates hyper-personalized cover letters that:
+- Address specific requirements in the job description
+- Highlight your most relevant projects
+- Adopt the company's tone and culture
 
-3. **Access the application**
-   - Frontend: http://localhost:8501
-   - Backend API: http://localhost:8000
-   - API Docs: http://localhost:8000/docs
-   - Airflow: http://localhost:8080
+### 🐙 GitHub Portfolio Analysis
+Connects to your GitHub via **MCP Server** to analyze your code quality, languages, and contributions, adding "hard proof" of your skills to your profile.
 
-### Local Development
+## ⚙️ Setup Instructions (Step-by-Step Guide)
 
+### 1. Clone the Repository
 ```bash
-# Create virtual environment
-python -m venv venv
-source venv/bin/activate
-
-# Install dependencies
-pip install -e ".[dev]"
-
-# Run backend
-cd backend && uvicorn app.main:app --reload
-
-# Run frontend (new terminal)
-cd frontend && streamlit run app.py
-
-# Run MCP servers (new terminals)
-cd mcp_servers/github-context && python server.py
-cd mcp_servers/job-market && python server.py
+git clone https://github.com/sahilk710/jobzilla-ai.git
+cd jobzilla-ai
 ```
 
-## 📁 Project Structure
+### 2. Configure Environment
+Create a `.env` file in the root directory (use `.env.example` if available, or ask the developer).
+
+### 3. Run with Docker
+The system uses Docker Compose to manage all services (Backend, Frontend, Database, Redis, etc.) seamlessly.
+```bash
+docker-compose up -d --build
+```
+
+### 4. Access the Application
+- **Frontend**: http://localhost:8501
+- **Backend API Docs**: http://localhost:8000/docs
+- **Airflow**: http://localhost:8080
+
+---
+
+## � Project Structure
 
 ```
-killmatch-agentic-suite/
-├── backend/              # FastAPI + LangGraph agents
+jobzilla-ai/
+├── backend/            # FastAPI Application
 │   ├── app/
-│   │   ├── api/         # REST endpoints
-│   │   ├── agents/      # LangGraph nodes & edges
-│   │   ├── models/      # Pydantic schemas
-│   │   └── services/    # Business logic
-├── frontend/             # Streamlit UI
-│   ├── app.py
-│   └── components/      # Reusable UI components
-├── mcp_servers/          # MCP protocol servers
-│   ├── github-context/  # GitHub profile analysis
-│   └── job-market/      # Job search & intel
-├── airflow/              # Orchestration DAGs
-│   └── dags/
-└── docs/                 # Documentation
+│   │   ├── agents/     # LangGraph Agent Definitions
+│   │   ├── api/        # API Routes
+│   │   └── models/     # Pydantic Models
+├── frontend/           # Streamlit Application
+├── mcp_servers/        # External Data Connectors
+│   ├── github-context/ # GitHub API Connector
+│   └── job-market/     # LinkedIn/Indeed Scraper
+├── airflow/            # Scheduled Tasks (DAGs)
+└── docker-compose.yml  # Infrastructure Definition
 ```
 
-## 🤖 Agent Pipeline
-
-The core matching uses a multi-agent debate pattern:
-
-1. **Profile Parser**: Extracts skills from resume + GitHub
-2. **Recruiter Agent**: Identifies concerns/weaknesses (devil's advocate)
-3. **Coach Agent**: Highlights strengths (candidate advocate)
-4. **Judge Agent**: Weighs arguments, provides final verdict
-5. **Skill Gap Agent**: Identifies missing skills with learning paths
-6. **Cover Writer**: Generates debate-informed cover letters
-7. **Improvement Agent**: Suggests profile enhancements
-
-## 🔌 API Endpoints
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/health` | GET | Health check |
-| `/api/v1/profile` | POST | Upload resume + GitHub |
-| `/api/v1/match` | POST | Run agent matching pipeline |
-| `/api/v1/cover-letter` | POST | Generate cover letter |
-| `/api/v1/analytics/{user_id}` | GET | User dashboard data |
-| `/api/v1/headhunter/{user_id}` | GET | Proactive recommendations |
-
-## ⚙️ Configuration
-
-Key environment variables:
-
-| Variable | Description |
-|----------|-------------|
-| `OPENAI_API_KEY` | OpenAI API key for LLM + embeddings |
-| `PINECONE_API_KEY` | Pinecone vector database key |
-| `GITHUB_TOKEN` | GitHub personal access token |
-| `TAVILY_API_KEY` | Tavily API for company intel |
-
-## 🧪 Testing
-
-```bash
-# Run all tests
-make test
-
-# Run specific test suites
-pytest backend/tests/unit -v
-pytest backend/tests/integration -v
-
-# Run with coverage
-pytest --cov=backend/app --cov-report=html
-```
-
-## 📊 Evaluation
-
-Compare agent-based matching vs naive cosine similarity:
-
-```bash
-cd eval
-python run_benchmark.py
-```
-
-## 🚢 Deployment
-
-### Backend (GCP Cloud Run)
-```bash
-gcloud run deploy killmatch-backend --source ./backend
-```
-
-### Frontend (Streamlit Cloud)
-1. Connect repository to Streamlit Cloud
-2. Set `frontend/app.py` as entry point
-3. Configure secrets in dashboard
-
-## 📝 License
-
-MIT License - see [LICENSE](LICENSE) for details.
+---
 
 ## 🤝 Contributing
 
@@ -196,3 +129,4 @@ MIT License - see [LICENSE](LICENSE) for details.
 
 ---
 
+*Powered by Caffeine and LLMs ☕🤖*
