@@ -68,6 +68,8 @@ def extract_text_from_pdf(pdf_content: bytes) -> str:
     """Extract text from PDF bytes using multiple methods."""
     text_parts = []
     
+    print(f"📄 Attempting PDF extraction ({len(pdf_content)} bytes)")
+    
     # Try pypdf first
     try:
         pdf_file = io.BytesIO(pdf_content)
@@ -77,8 +79,10 @@ def extract_text_from_pdf(pdf_content: bytes) -> str:
             page_text = page.extract_text()
             if page_text:
                 text_parts.append(page_text)
-    except Exception:
-        pass
+        if text_parts:
+            print(f"✅ pypdf extracted {len(text_parts)} pages")
+    except Exception as e:
+        print(f"⚠️ pypdf extraction failed: {e}")
     
     # If pypdf failed, try pdfplumber
     if not text_parts:
@@ -89,10 +93,28 @@ def extract_text_from_pdf(pdf_content: bytes) -> str:
                     page_text = page.extract_text()
                     if page_text:
                         text_parts.append(page_text)
-        except Exception:
-            pass
+            if text_parts:
+                print(f"✅ pdfplumber extracted {len(text_parts)} pages")
+        except Exception as e:
+            print(f"⚠️ pdfplumber extraction failed: {e}")
     
-    return "\n".join(text_parts)
+    # Last resort: try to decode raw bytes as text (for text-based PDFs)
+    if not text_parts:
+        try:
+            raw_text = pdf_content.decode("utf-8", errors="ignore")
+            # Extract readable text between PDF stream markers
+            import re
+            text_chunks = re.findall(r'\(([^)]+)\)', raw_text)
+            readable = " ".join(text_chunks)
+            if len(readable) > 50:
+                text_parts.append(readable)
+                print(f"✅ Raw text fallback extracted {len(readable)} chars")
+        except Exception as e:
+            print(f"⚠️ Raw text fallback failed: {e}")
+    
+    result = "\n".join(text_parts)
+    print(f"📄 Total extracted text: {len(result)} chars")
+    return result
 
 
 # =============================================================================

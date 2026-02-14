@@ -136,6 +136,109 @@ def fetch_jobs_from_db(limit=10):
         return []
 
 
+@st.cache_data(ttl=300)  # Cache for 5 minutes
+def fetch_analytics_data():
+    """Fetch comprehensive analytics data from the database."""
+    result = {
+        "jobs": [],
+        "skill_counts": {},
+        "salary_data": [],
+        "remote_distribution": {},
+        "location_data": {},
+        "experience_levels": {},
+    }
+    
+    try:
+        import psycopg2
+        import json as json_module
+        
+        conn = psycopg2.connect(
+            host=os.getenv("DB_HOST", "localhost"),
+            port=os.getenv("DB_PORT", "5432"),
+            database=os.getenv("DB_NAME", "killmatch"),
+            user=os.getenv("DB_USER", "postgres"),
+            password=os.getenv("DB_PASSWORD", "postgres")
+        )
+        cur = conn.cursor()
+        
+        # 1. Fetch all active jobs with full data
+        cur.execute("""
+            SELECT id, title, company, description, source_platform, 
+                   required_skills, preferred_skills, salary_min, salary_max,
+                   remote_type, experience_level, location
+            FROM jobs 
+            WHERE is_active = true
+            ORDER BY scraped_at DESC 
+            LIMIT 500
+        """)
+        
+        skill_counter = {}
+        
+        for row in cur.fetchall():
+            job = {
+                "id": row[0], "title": row[1], "company": row[2],
+                "description": row[3] or "", "source": row[4] or "LinkedIn",
+                "required_skills": row[5], "preferred_skills": row[6],
+                "salary_min": row[7], "salary_max": row[8],
+                "remote_type": row[9], "experience_level": row[10],
+                "location": row[11],
+            }
+            result["jobs"].append(job)
+            
+            # Count skills
+            req_skills = row[5] if isinstance(row[5], list) else []
+            pref_skills = row[6] if isinstance(row[6], list) else []
+            for skill in req_skills + pref_skills:
+                if skill and isinstance(skill, str):
+                    skill_counter[skill] = skill_counter.get(skill, 0) + 1
+            
+            # If no explicit skills, extract from description
+            if not req_skills and not pref_skills and row[3]:
+                desc_lower = (row[3] or "").lower()
+                common_skills = [
+                    "Python", "JavaScript", "TypeScript", "Java", "C++", "Go", "Rust", "Ruby",
+                    "React", "Node.js", "Angular", "Vue", "Django", "Flask", "FastAPI", "Spring",
+                    "AWS", "GCP", "Azure", "Docker", "Kubernetes", "Terraform",
+                    "PostgreSQL", "MySQL", "MongoDB", "Redis", "Elasticsearch",
+                    "Machine Learning", "Deep Learning", "NLP", "SQL", "Git", "Linux",
+                    "TensorFlow", "PyTorch", "Pandas", "Spark", "Airflow", "Kafka",
+                    "REST", "GraphQL", "CI/CD", "Agile", "Scrum",
+                ]
+                for s in common_skills:
+                    if s.lower() in desc_lower:
+                        skill_counter[s] = skill_counter.get(s, 0) + 1
+            
+            # Salary data
+            if row[7] or row[8]:
+                result["salary_data"].append({
+                    "level": row[10] or "Unknown",
+                    "salary_min": row[7] or 0,
+                    "salary_max": row[8] or row[7] or 0,
+                })
+            
+            # Remote distribution
+            remote = row[9] or "Unknown"
+            result["remote_distribution"][remote] = result["remote_distribution"].get(remote, 0) + 1
+            
+            # Experience levels
+            exp = row[10] or "Unknown"
+            result["experience_levels"][exp] = result["experience_levels"].get(exp, 0) + 1
+            
+            # Location
+            loc = row[11] or "Unknown"
+            result["location_data"][loc] = result["location_data"].get(loc, 0) + 1
+        
+        result["skill_counts"] = skill_counter
+        
+        cur.close()
+        conn.close()
+        
+    except Exception as e:
+        print(f"⚠️ Analytics data fetch failed: {e}")
+    
+    return result
+
+
 def main():
     """Main application entry point."""
     # Sidebar
@@ -247,6 +350,9 @@ def show_job_match():
             st.success("✅ Resume uploaded successfully!")
             st.session_state["resume_uploaded"] = True
             st.session_state["resume_file"] = uploaded_file
+            # Store raw bytes so we can reliably re-read them
+            st.session_state["resume_bytes"] = uploaded_file.read()
+            uploaded_file.seek(0)  # Reset for any other readers
     
     with col2:
         st.markdown("### 🎯 Job Search")
@@ -286,8 +392,10 @@ def show_job_match():
                 
                 # If resume uploaded, send it
                 files = {}
-                if st.session_state.get("resume_file"):
-                    # Reset buffer position
+                if st.session_state.get("resume_bytes"):
+                    # Use stored raw bytes for reliable re-reads
+                    files = {"resume": ("resume.pdf", st.session_state["resume_bytes"], "application/pdf")}
+                elif st.session_state.get("resume_file"):
                     st.session_state["resume_file"].seek(0)
                     files = {"resume": ("resume.pdf", st.session_state["resume_file"], "application/pdf")}
                     
@@ -304,6 +412,10 @@ def show_job_match():
                     results = response.json()
                     st.session_state["matched_jobs"] = results.get("matches", [])
                     st.session_state["has_matches"] = True
+                    # Store parsed skills for analytics skill gap report
+                    parsed_skills = results.get("parsed_skills", [])
+                    if parsed_skills:
+                        st.session_state["resume_skills"] = parsed_skills
                     st.rerun()
                 else:
                     st.error(f"Validation failed: {response.text}")
@@ -370,17 +482,86 @@ def run_langgraph_debate(job, resume_text, resume_skills, github_username):
 
 def show_agent_debate():
     """Enhanced Agent debate with job selection and detailed AI insights."""
-    st.markdown('<h1 class="main-header">🤖 Agent Debate</h1>', unsafe_allow_html=True)
+    st.markdown('<h1 class="main-header">🤖 Multi-Agent AI Debate</h1>', unsafe_allow_html=True)
     
-    # Explain the feature clearly
-    st.info("""
-    **How It Works:**
-    - 🔴 **Recruiter Agent** plays devil's advocate and finds gaps
-    - 🟢 **Coach Agent** advocates for your strengths and potential
-    - ⚖️ **Judge Agent** listens to the debate and issues a final verdict
-    """)
+    # ─── Hero Explanation ───
+    st.markdown("""
+    <div style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%); 
+                padding: 24px; border-radius: 16px; margin-bottom: 24px; color: white;">
+        <h3 style="color: #e94560; margin-top: 0;">🎯 What is the Agent Debate?</h3>
+        <p style="font-size: 1.05em; line-height: 1.6; color: #e0e0e0;">
+            Instead of giving you a <b>simple match score</b>, Jobzilla uses <b>3 AI agents powered by GPT-4</b> 
+            that <em>debate</em> whether you're a good fit for a job — just like a real hiring committee. 
+            Each agent has a unique perspective, creating a <b>balanced, multi-dimensional analysis</b> of your candidacy.
+        </p>
+    </div>
+    """, unsafe_allow_html=True)
     
-    # Check if we have matched jobs
+    # ─── Meet the Agents ───
+    st.markdown("### 🧑‍💼 Meet Your AI Hiring Committee")
+    
+    agent_col1, agent_col2, agent_col3 = st.columns(3)
+    
+    with agent_col1:
+        st.markdown("""
+        <div style="background: linear-gradient(135deg, #ff6b6b20, #ee535320); 
+                    border: 2px solid #ff6b6b; border-radius: 12px; padding: 20px; height: 280px;">
+            <h3 style="color: #ff6b6b; text-align: center;">🔴 The Recruiter</h3>
+            <p style="font-weight: bold; text-align: center; color: #ff6b6b;">Devil's Advocate</p>
+            <hr style="border-color: #ff6b6b40;">
+            <p style="font-size: 0.9em;">Plays the role of a <b>skeptical hiring manager</b>. 
+            Identifies gaps in your experience, missing skills, and potential red flags — 
+            the tough questions you'd face in a real interview.</p>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    with agent_col2:
+        st.markdown("""
+        <div style="background: linear-gradient(135deg, #51cf6620, #2ed57320); 
+                    border: 2px solid #51cf66; border-radius: 12px; padding: 20px; height: 280px;">
+            <h3 style="color: #51cf66; text-align: center;">🟢 The Career Coach</h3>
+            <p style="font-weight: bold; text-align: center; color: #51cf66;">Your Advocate</p>
+            <hr style="border-color: #51cf6640;">
+            <p style="font-size: 0.9em;">Acts as your <b>personal career champion</b>. 
+            Highlights transferable skills, reframes weaknesses as growth areas, and 
+            emphasizes your unique strengths and potential.</p>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    with agent_col3:
+        st.markdown("""
+        <div style="background: linear-gradient(135deg, #ffd43b20, #fab00520); 
+                    border: 2px solid #ffd43b; border-radius: 12px; padding: 20px; height: 280px;">
+            <h3 style="color: #ffd43b; text-align: center;">⚖️ The Judge</h3>
+            <p style="font-weight: bold; text-align: center; color: #ffd43b;">Final Arbiter</p>
+            <hr style="border-color: #ffd43b40;">
+            <p style="font-size: 0.9em;">Listens to <b>both sides of the debate</b>, weighs the arguments, 
+            and delivers a <b>fair, balanced verdict</b> with a final match score and 
+            actionable recommendation.</p>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    # ─── Why This Matters ───
+    with st.expander("💡 **Why is this better than a simple match score?**", expanded=False):
+        st.markdown("""
+        | Traditional Matching | 🤖 Agent Debate |
+        |---------------------|-----------------|
+        | Simple keyword overlap | Deep semantic understanding of your experience |
+        | One score, no explanation | Multi-perspective analysis with reasoning |
+        | Misses transferable skills | Coach agent identifies hidden strengths |
+        | No actionable feedback | Specific gaps to address before applying |
+        | Static algorithm | Dynamic AI agents that adapt to each job |
+        
+        **How this helps you:**
+        - 🎯 **Know before you apply** — Understand exactly how strong your candidacy is
+        - 📈 **Improve strategically** — See specific skill gaps to close
+        - 💪 **Discover hidden strengths** — The Coach finds things you might not think to mention
+        - ⚠️ **Anticipate objections** — Know what a recruiter might flag before your interview
+        """)
+    
+    st.divider()
+    
+    # ─── Job Selector ───
     if not st.session_state.get("matched_jobs"):
         st.warning("No job matches found. Go to **Job Match** and run a search first!")
         if st.button("🔍 Go to Job Match"):
@@ -389,7 +570,6 @@ def show_agent_debate():
     
     matched_jobs = st.session_state["matched_jobs"]
     
-    # JOB SELECTOR - Let user choose which job to analyze
     st.markdown("### 📋 Select a Job to Analyze")
     job_options = [f"{j['title']} at {j['company']}" for j in matched_jobs]
     selected_idx = st.selectbox(
@@ -403,7 +583,6 @@ def show_agent_debate():
     
     # Get resume data from session
     resume_summary = st.session_state.get("resume_summary", "")
-    # We need skills list - try to parse from summary or use empty
     resume_skills = [] 
     
     # UI Controls
@@ -420,60 +599,112 @@ def show_agent_debate():
                 if result:
                     st.session_state[job_key] = result
                     st.rerun()
+    with col2:
+        if job_key not in st.session_state:
+            st.caption("⏱️ Debate typically takes 15-30 seconds as 3 AI agents analyze your profile in real-time.")
     
-    # Display Results if available
+    # ─── Display Results ───
     if job_key in st.session_state:
         result = st.session_state[job_key]
         
-        st.divider()
-        st.markdown("## 🎙️ Live Debate Transcript")
-        
-        # Show debate rounds
-        for round_data in result.get("debate_rounds", []):
-            round_num = round_data.get("round_number", 1)
-            
-            with st.expander(f"�️ Round {round_num}", expanded=True):
-                # Recruiter
-                st.markdown("#### 🔴 Recruiter's Arguments")
-                for arg in round_data.get("recruiter_arguments", []):
-                    st.markdown(f"• **{arg.get('point')}**: {arg.get('evidence')} ({arg.get('strength')})")
-                st.caption(f"Score: {round_data.get('recruiter_score')}/100")
-                
-                st.divider()
-                
-                # Coach
-                st.markdown("#### � Coach's Rebuttal")
-                for arg in round_data.get("coach_arguments", []):
-                    st.markdown(f"• **{arg.get('point')}**: {arg.get('evidence')} ({arg.get('strength')})")
-                st.caption(f"Score: {round_data.get('coach_score')}/100")
-
-        # Final Verdict
+        # ─── Final Verdict (show first for impact) ───
         st.divider()
         st.markdown("## ⚖️ Judge's Final Verdict")
         
         final_score = result.get("final_score", 50)
         recommendation = result.get("recommendation", "Unknown")
         
-        col1, col2 = st.columns([1, 2])
-        with col1:
-            st.metric("Final Match Score", f"{final_score:.1f}/100")
-        with col2:
-            color = "🟢" if final_score >= 75 else "🟡" if final_score >= 55 else "�"
-            st.markdown(f"### {color} {recommendation}")
+        # Score with color
+        if final_score >= 75:
+            score_color, score_emoji, score_label = "#51cf66", "🟢", "Strong Match"
+        elif final_score >= 55:
+            score_color, score_emoji, score_label = "#ffd43b", "🟡", "Possible Match"
+        else:
+            score_color, score_emoji, score_label = "#ff6b6b", "🔴", "Weak Match"
         
-        # Key factors
-        c1, c2 = st.columns(2)
-        with c1:
-            st.markdown("**👍 Key Strengths**")
-            for item in result.get("key_strengths", []):
-                st.markdown(f"• {item}")
-        with c2:
-            st.markdown("**� Key Concerns**")
-            for item in result.get("key_concerns", []):
-                st.markdown(f"• {item}")
+        score_col1, score_col2 = st.columns([1, 2])
+        with score_col1:
+            st.markdown(f"""
+            <div style="text-align: center; padding: 20px; background: linear-gradient(135deg, {score_color}15, {score_color}30); 
+                        border: 2px solid {score_color}; border-radius: 16px;">
+                <p style="font-size: 3em; font-weight: bold; color: {score_color}; margin: 0;">{final_score:.0f}</p>
+                <p style="color: {score_color}; font-size: 0.9em; margin: 0;">out of 100</p>
+                <p style="font-size: 1.2em; margin-top: 8px;">{score_emoji} {recommendation}</p>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        with score_col2:
+            # Key factors side by side
+            str_col, con_col = st.columns(2)
+            with str_col:
+                st.markdown("**👍 Key Strengths**")
+                for item in result.get("key_strengths", []):
+                    st.markdown(f"✅ {item}")
+            with con_col:
+                st.markdown("**⚠️ Key Concerns**")
+                for item in result.get("key_concerns", []):
+                    st.markdown(f"❌ {item}")
+        
+        # ─── Skill Gaps ───
+        skill_gaps = result.get("skill_gaps", [])
+        if skill_gaps:
+            st.divider()
+            st.markdown("### 📈 Skills to Develop")
+            st.caption("These are the gaps identified during the debate. Closing these will significantly improve your candidacy.")
+            gap_cols = st.columns(min(len(skill_gaps), 4))
+            for i, gap in enumerate(skill_gaps):
+                with gap_cols[i % len(gap_cols)]:
+                    st.markdown(f"""
+                    <div style="background: #fff3e020; border: 1px solid #ef6c00; border-radius: 8px; padding: 12px; text-align: center; margin-bottom: 8px;">
+                        <p style="font-weight: bold; color: #ef6c00; margin: 0;">📚 {gap}</p>
+                    </div>
+                    """, unsafe_allow_html=True)
+        
+        # ─── Debate Transcript ───
+        st.divider()
+        st.markdown("### 🎙️ Full Debate Transcript")
+        st.caption("Expand each round to see the detailed arguments from both sides.")
+        
+        for round_data in result.get("debate_rounds", []):
+            round_num = round_data.get("round_number", 1)
+            r_score = round_data.get("recruiter_score", 50)
+            c_score = round_data.get("coach_score", 50)
+            
+            with st.expander(f"🏟️ Round {round_num}  |  Recruiter: {r_score:.0f}  vs  Coach: {c_score:.0f}", expanded=(round_num == 1)):
+                r_col, c_col = st.columns(2)
+                
+                with r_col:
+                    st.markdown("#### 🔴 Recruiter's Concerns")
+                    for arg in round_data.get("recruiter_arguments", []):
+                        strength = arg.get("strength", "Medium")
+                        icon = "🔥" if strength == "Strong" else "⚡" if strength == "Medium" else "💨"
+                        st.markdown(f"{icon} **{arg.get('point')}**")
+                        if arg.get("evidence"):
+                            st.caption(f"   _{arg.get('evidence')}_")
+                
+                with c_col:
+                    st.markdown("#### 🟢 Coach's Rebuttal")
+                    for arg in round_data.get("coach_arguments", []):
+                        strength = arg.get("strength", "Medium")
+                        icon = "💎" if strength == "Strong" else "✨" if strength == "Medium" else "🌱"
+                        st.markdown(f"{icon} **{arg.get('point')}**")
+                        if arg.get("evidence"):
+                            st.caption(f"   _{arg.get('evidence')}_")
+        
+        # ─── Processing Info ───
+        proc_time = result.get("processing_time_seconds", 0)
+        total_rounds = result.get("total_rounds", 0)
+        if proc_time > 0:
+            st.divider()
+            st.caption(f"⏱️ Debate completed in {proc_time:.1f}s across {total_rounds} round(s) using GPT-4 agents.")
                 
     else:
-        st.info("👆 Click 'Run AI Debate' to see the Recruiter and Career Coach analyze your fit for this role in real-time!")
+        st.markdown("""
+        <div style="background: #1a1a2e; padding: 24px; border-radius: 12px; text-align: center; margin-top: 16px;">
+            <p style="font-size: 1.1em; color: #aaa;">👆 Select a job above and click <b style="color: #e94560;">'Run AI Debate'</b> to watch 
+            the Recruiter and Career Coach analyze your fit for this role in real-time!</p>
+        </div>
+        """, unsafe_allow_html=True)
 
 
 
@@ -698,94 +929,439 @@ def show_skill_roadmap():
 
 
 def show_analytics():
-    """Enhanced Analytics dashboard with personal insights and database stats."""
-    st.markdown('<h1 class="main-header">📊 Analytics</h1>', unsafe_allow_html=True)
+    """Enhanced Analytics dashboard with interactive charts and actionable insights."""
+    import plotly.graph_objects as go
+    import plotly.express as px
+    import pandas as pd
+    import json as json_lib
     
-    st.info("**Your Job Search Analytics**: Track your searches, analyze company trends, and see skills in demand.")
+    st.markdown('<h1 class="main-header">📊 Analytics & Insights</h1>', unsafe_allow_html=True)
     
-    # ============ PERSONAL ANALYTICS ============
-    st.markdown("### 👤 Your Activity")
+    st.markdown("""
+    <div style="background: linear-gradient(135deg, rgba(99,102,241,0.15) 0%, rgba(139,92,246,0.10) 100%); 
+                border-radius: 16px; padding: 1.2rem 1.5rem; margin-bottom: 1.5rem; 
+                border: 1px solid rgba(99,102,241,0.2);">
+        <p style="margin: 0; font-size: 1.05rem;">
+            🎯 <strong>Your AI-Powered Job Intelligence Hub</strong> — Understand the market, identify your skill gaps, and make data-driven career decisions.
+        </p>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # ============ FETCH ALL DATA ============
+    matched_jobs = st.session_state.get("matched_jobs", [])
+    user_skills = [s.lower() for s in st.session_state.get("resume_skills", [])]
+    
+    # Fetch rich data from database
+    analytics_data = fetch_analytics_data()
+    all_jobs = analytics_data.get("jobs", [])
+    skill_counts = analytics_data.get("skill_counts", {})
+    salary_data = analytics_data.get("salary_data", [])
+    remote_distribution = analytics_data.get("remote_distribution", {})
+    location_data = analytics_data.get("location_data", {})
+    experience_levels = analytics_data.get("experience_levels", {})
+    
+    # ============ SECTION 1: HERO STATS ============
+    st.markdown("### 🏆 Your Dashboard")
+    
     col1, col2, col3, col4 = st.columns(4)
     
-    matched_jobs = st.session_state.get("matched_jobs", [])
-    
     with col1:
-        st.metric("Jobs Matched", len(matched_jobs))
+        st.markdown(f"""
+        <div style="background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%); 
+                    border-radius: 16px; padding: 1.5rem; text-align: center;">
+            <p style="color: rgba(255,255,255,0.8); margin: 0; font-size: 0.85rem;">JOBS MATCHED</p>
+            <h2 style="color: white; margin: 0.3rem 0 0 0; font-size: 2.2rem;">{len(matched_jobs)}</h2>
+        </div>
+        """, unsafe_allow_html=True)
+    
     with col2:
         if matched_jobs:
             avg_score = sum(j.get("match_score", 0) for j in matched_jobs) / len(matched_jobs)
             avg_score = avg_score * 100 if avg_score <= 1 else avg_score
-            st.metric("Avg Match Score", f"{avg_score:.0f}%")
+            score_color = "#10b981" if avg_score >= 70 else "#f59e0b" if avg_score >= 50 else "#ef4444"
         else:
-            st.metric("Avg Match Score", "N/A")
+            avg_score = 0
+            score_color = "#6b7280"
+        st.markdown(f"""
+        <div style="background: linear-gradient(135deg, {score_color}22 0%, {score_color}11 100%); 
+                    border-radius: 16px; padding: 1.5rem; text-align: center; 
+                    border: 1px solid {score_color}33;">
+            <p style="color: rgba(255,255,255,0.8); margin: 0; font-size: 0.85rem;">AVG MATCH SCORE</p>
+            <h2 style="color: {score_color}; margin: 0.3rem 0 0 0; font-size: 2.2rem;">{avg_score:.0f}%</h2>
+        </div>
+        """, unsafe_allow_html=True)
+    
     with col3:
-        resume_status = "✅ Yes" if st.session_state.get("resume_uploaded") else "❌ No"
-        st.metric("Resume Uploaded", resume_status)
+        db_count = len(all_jobs)
+        st.markdown(f"""
+        <div style="background: linear-gradient(135deg, rgba(16,185,129,0.15) 0%, rgba(16,185,129,0.05) 100%); 
+                    border-radius: 16px; padding: 1.5rem; text-align: center; 
+                    border: 1px solid rgba(16,185,129,0.2);">
+            <p style="color: rgba(255,255,255,0.8); margin: 0; font-size: 0.85rem;">JOBS IN DATABASE</p>
+            <h2 style="color: #10b981; margin: 0.3rem 0 0 0; font-size: 2.2rem;">{db_count}</h2>
+        </div>
+        """, unsafe_allow_html=True)
+    
     with col4:
-        gh_user = st.session_state.get("github_username", "")
-        st.metric("GitHub Connected", gh_user if gh_user else "❌ No")
+        skills_count = len(user_skills) if user_skills else 0
+        resume_ok = st.session_state.get("resume_uploaded", False)
+        st.markdown(f"""
+        <div style="background: linear-gradient(135deg, rgba(245,158,11,0.15) 0%, rgba(245,158,11,0.05) 100%); 
+                    border-radius: 16px; padding: 1.5rem; text-align: center; 
+                    border: 1px solid rgba(245,158,11,0.2);">
+            <p style="color: rgba(255,255,255,0.8); margin: 0; font-size: 0.85rem;">YOUR SKILLS</p>
+            <h2 style="color: #f59e0b; margin: 0.3rem 0 0 0; font-size: 2.2rem;">{"✅ " + str(skills_count) if resume_ok else "❌ Upload"}</h2>
+        </div>
+        """, unsafe_allow_html=True)
     
-    # ============ MATCHED JOBS ANALYSIS ============
-    if matched_jobs:
-        st.divider()
-        st.markdown("### 🏢 Companies in Your Matches")
-        
-        # Company breakdown
-        companies = {}
-        for job in matched_jobs:
-            company = job.get("company", "Unknown")
-            companies[company] = companies.get(company, 0) + 1
-        
-        sorted_companies = sorted(companies.items(), key=lambda x: x[1], reverse=True)
-        
-        cols = st.columns(min(len(sorted_companies), 4))
-        for i, (company, count) in enumerate(sorted_companies[:4]):
-            with cols[i]:
-                st.metric(company[:15] + "..." if len(company) > 15 else company, f"{count} jobs")
-        
-        # Match score distribution
-        st.divider()
-        st.markdown("### 📈 Match Score Distribution")
-        
-        high_matches = len([j for j in matched_jobs if (j.get("match_score", 0) * 100 if j.get("match_score", 0) <= 1 else j.get("match_score", 0)) >= 70])
-        med_matches = len([j for j in matched_jobs if 50 <= (j.get("match_score", 0) * 100 if j.get("match_score", 0) <= 1 else j.get("match_score", 0)) < 70])
-        low_matches = len([j for j in matched_jobs if (j.get("match_score", 0) * 100 if j.get("match_score", 0) <= 1 else j.get("match_score", 0)) < 50])
-        
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("🟢 Strong (70%+)", high_matches)
-        with col2:
-            st.metric("🟡 Good (50-70%)", med_matches)
-        with col3:
-            st.metric("🟠 Stretch (<50%)", low_matches)
-    
-    # ============ DATABASE STATS ============
     st.divider()
-    st.markdown("### 🗄️ Job Database Stats")
     
-    jobs = fetch_jobs_from_db(limit=100)
+    # ============ SECTION 2: SKILLS IN DEMAND ============
+    st.markdown("### 🔥 Top Skills in Demand")
+    st.caption("Skills most frequently required across all job listings in the database")
     
-    col1, col2 = st.columns(2)
-    with col1:
-        st.metric("Total Jobs Available", len(jobs))
-    with col2:
-        if jobs:
-            sources = set(j.get('source', 'Unknown') for j in jobs)
-            st.metric("Job Sources", len(sources))
-    
-    # Source breakdown
-    if jobs:
-        sources = {}
-        for job in jobs:
-            src = job.get('source', 'Unknown')
-            sources[src] = sources.get(src, 0) + 1
+    if skill_counts:
+        top_skills = dict(sorted(skill_counts.items(), key=lambda x: x[1], reverse=True)[:15])
         
-        st.markdown("#### Jobs by Platform")
-        for src, count in sorted(sources.items(), key=lambda x: x[1], reverse=True):
-            pct = (count / len(jobs)) * 100
-            st.progress(pct / 100, text=f"**{src}**: {count} jobs ({pct:.0f}%)")
+        # Color-code: green if user has the skill, red if they don't
+        colors = []
+        for skill in top_skills:
+            if skill.lower() in user_skills:
+                colors.append("#10b981")  # green — user has it
+            else:
+                colors.append("#ef4444")  # red — skill gap
+        
+        fig_skills = go.Figure(data=[
+            go.Bar(
+                x=list(top_skills.values()),
+                y=list(top_skills.keys()),
+                orientation='h',
+                marker=dict(
+                    color=colors,
+                    line=dict(color='rgba(255,255,255,0.1)', width=1)
+                ),
+                text=[f"{v} jobs" for v in top_skills.values()],
+                textposition='auto',
+                hovertemplate='<b>%{y}</b><br>Required in %{x} jobs<extra></extra>'
+            )
+        ])
+        fig_skills.update_layout(
+            plot_bgcolor='rgba(0,0,0,0)',
+            paper_bgcolor='rgba(0,0,0,0)',
+            font=dict(color='white'),
+            height=450,
+            margin=dict(l=10, r=10, t=30, b=10),
+            xaxis=dict(title="Number of Jobs", gridcolor='rgba(255,255,255,0.05)'),
+            yaxis=dict(autorange="reversed"),
+        )
+        
+        st.plotly_chart(fig_skills, use_container_width=True)
+        
+        if user_skills:
+            st.markdown("""
+            <div style="display: flex; gap: 1rem; align-items: center; margin-top: -0.5rem;">
+                <span style="display: inline-flex; align-items: center; gap: 0.3rem;">
+                    <span style="width: 12px; height: 12px; background: #10b981; border-radius: 3px; display: inline-block;"></span>
+                    <span style="font-size: 0.85rem; color: rgba(255,255,255,0.7);">You have this skill</span>
+                </span>
+                <span style="display: inline-flex; align-items: center; gap: 0.3rem;">
+                    <span style="width: 12px; height: 12px; background: #ef4444; border-radius: 3px; display: inline-block;"></span>
+                    <span style="font-size: 0.85rem; color: rgba(255,255,255,0.7);">Skill gap — consider learning</span>
+                </span>
+            </div>
+            """, unsafe_allow_html=True)
     else:
-        st.warning("No jobs in database. Run the job vectorization script first.")
+        st.info("No skill data available yet. Jobs need `required_skills` data in the database.")
+    
+    st.divider()
+    
+    # ============ SECTION 3 & 4: MATCH SCORE + SALARY (side by side) ============
+    col_left, col_right = st.columns(2)
+    
+    with col_left:
+        st.markdown("### 🎯 Match Score Breakdown")
+        
+        if matched_jobs:
+            # Normalize scores
+            scores = []
+            for j in matched_jobs:
+                s = j.get("match_score", 0)
+                scores.append(s * 100 if s <= 1 else s)
+            
+            high = len([s for s in scores if s >= 70])
+            med = len([s for s in scores if 50 <= s < 70])
+            low = len([s for s in scores if s < 50])
+            
+            fig_donut = go.Figure(data=[go.Pie(
+                labels=['Strong (70%+)', 'Good (50-70%)', 'Stretch (<50%)'],
+                values=[high, med, low],
+                hole=0.6,
+                marker=dict(colors=['#10b981', '#f59e0b', '#ef4444']),
+                textinfo='value+percent',
+                textfont=dict(size=14),
+                hovertemplate='<b>%{label}</b><br>%{value} jobs (%{percent})<extra></extra>'
+            )])
+            fig_donut.update_layout(
+                plot_bgcolor='rgba(0,0,0,0)',
+                paper_bgcolor='rgba(0,0,0,0)',
+                font=dict(color='white'),
+                height=350,
+                margin=dict(l=10, r=10, t=10, b=10),
+                showlegend=True,
+                legend=dict(orientation="h", yanchor="bottom", y=-0.15, xanchor="center", x=0.5),
+                annotations=[dict(text=f'{avg_score:.0f}%', x=0.5, y=0.5, font_size=28, font_color=score_color, showarrow=False)]
+            )
+            st.plotly_chart(fig_donut, use_container_width=True)
+        else:
+            st.markdown("""
+            <div style="background: rgba(255,255,255,0.03); border-radius: 12px; padding: 3rem; text-align: center;">
+                <p style="font-size: 3rem; margin: 0;">🎯</p>
+                <p style="color: rgba(255,255,255,0.5);">Run a job match to see your score distribution</p>
+            </div>
+            """, unsafe_allow_html=True)
+    
+    with col_right:
+        st.markdown("### 💰 Salary Insights")
+        
+        if salary_data:
+            df_salary = pd.DataFrame(salary_data)
+            
+            fig_salary = go.Figure()
+            for level in df_salary['level'].unique():
+                level_data = df_salary[df_salary['level'] == level]
+                fig_salary.add_trace(go.Box(
+                    y=level_data['salary_max'],
+                    name=level or 'Unknown',
+                    marker_color='#8b5cf6',
+                    boxmean=True,
+                    hovertemplate='<b>%{x}</b><br>Salary: $%{y:,.0f}<extra></extra>'
+                ))
+            
+            fig_salary.update_layout(
+                plot_bgcolor='rgba(0,0,0,0)',
+                paper_bgcolor='rgba(0,0,0,0)',
+                font=dict(color='white'),
+                height=350,
+                margin=dict(l=10, r=10, t=10, b=10),
+                yaxis=dict(title="Salary ($)", gridcolor='rgba(255,255,255,0.05)', tickformat='$,.0f'),
+                showlegend=False,
+            )
+            st.plotly_chart(fig_salary, use_container_width=True)
+        else:
+            # Show what salary data we could have
+            st.markdown("""
+            <div style="background: rgba(255,255,255,0.03); border-radius: 12px; padding: 3rem; text-align: center;">
+                <p style="font-size: 3rem; margin: 0;">💰</p>
+                <p style="color: rgba(255,255,255,0.5);">Salary data will appear when jobs include salary information</p>
+            </div>
+            """, unsafe_allow_html=True)
+    
+    st.divider()
+    
+    # ============ SECTION 5: COMPANY + REMOTE + EXPERIENCE ============
+    st.markdown("### 🏢 Job Market Overview")
+    
+    col_a, col_b, col_c = st.columns(3)
+    
+    with col_a:
+        st.markdown("##### 📍 Work Type Distribution")
+        if remote_distribution:
+            labels = list(remote_distribution.keys())
+            values = list(remote_distribution.values())
+            # Map to nice colors
+            color_map = {'remote': '#10b981', 'hybrid': '#f59e0b', 'on-site': '#6366f1', 'onsite': '#6366f1'}
+            pie_colors = [color_map.get(l.lower(), '#8b5cf6') for l in labels]
+            
+            fig_remote = go.Figure(data=[go.Pie(
+                labels=labels,
+                values=values,
+                marker=dict(colors=pie_colors),
+                textinfo='label+percent',
+                textfont=dict(size=12),
+                hole=0.3,
+            )])
+            fig_remote.update_layout(
+                plot_bgcolor='rgba(0,0,0,0)',
+                paper_bgcolor='rgba(0,0,0,0)',
+                font=dict(color='white'),
+                height=280,
+                margin=dict(l=5, r=5, t=5, b=5),
+                showlegend=False,
+            )
+            st.plotly_chart(fig_remote, use_container_width=True)
+        else:
+            st.caption("No work type data available")
+    
+    with col_b:
+        st.markdown("##### 📊 Experience Levels")
+        if experience_levels:
+            levels = list(experience_levels.keys())
+            counts = list(experience_levels.values())
+            
+            fig_exp = go.Figure(data=[go.Bar(
+                x=levels,
+                y=counts,
+                marker=dict(
+                    color=['#6366f1', '#8b5cf6', '#a78bfa', '#c4b5fd', '#ddd6fe'][:len(levels)],
+                    line=dict(color='rgba(255,255,255,0.1)', width=1)
+                ),
+                text=counts,
+                textposition='auto',
+            )])
+            fig_exp.update_layout(
+                plot_bgcolor='rgba(0,0,0,0)',
+                paper_bgcolor='rgba(0,0,0,0)',
+                font=dict(color='white'),
+                height=280,
+                margin=dict(l=5, r=5, t=5, b=5),
+                xaxis=dict(tickangle=-45),
+                yaxis=dict(gridcolor='rgba(255,255,255,0.05)'),
+            )
+            st.plotly_chart(fig_exp, use_container_width=True)
+        else:
+            st.caption("No experience level data available")
+    
+    with col_c:
+        st.markdown("##### 🏢 Top Companies Hiring")
+        if all_jobs:
+            companies = {}
+            for job in all_jobs:
+                c = job.get('company', 'Unknown')
+                companies[c] = companies.get(c, 0) + 1
+            top_companies = dict(sorted(companies.items(), key=lambda x: x[1], reverse=True)[:8])
+            
+            fig_companies = go.Figure(data=[go.Bar(
+                y=list(top_companies.keys()),
+                x=list(top_companies.values()),
+                orientation='h',
+                marker=dict(
+                    color='#6366f1',
+                    line=dict(color='rgba(255,255,255,0.1)', width=1)
+                ),
+                text=list(top_companies.values()),
+                textposition='auto',
+            )])
+            fig_companies.update_layout(
+                plot_bgcolor='rgba(0,0,0,0)',
+                paper_bgcolor='rgba(0,0,0,0)',
+                font=dict(color='white'),
+                height=280,
+                margin=dict(l=5, r=5, t=5, b=5),
+                yaxis=dict(autorange="reversed"),
+                xaxis=dict(gridcolor='rgba(255,255,255,0.05)'),
+            )
+            st.plotly_chart(fig_companies, use_container_width=True)
+        else:
+            st.caption("No company data available")
+    
+    st.divider()
+    
+    # ============ SECTION 6: YOUR SKILL GAP REPORT ============
+    st.markdown("### 🎓 Your Personalized Skill Gap Report")
+    
+    if user_skills and skill_counts:
+        # Get top 10 in-demand skills
+        top_demand = dict(sorted(skill_counts.items(), key=lambda x: x[1], reverse=True)[:10])
+        
+        # Build radar chart data
+        radar_skills = list(top_demand.keys())
+        market_demand = [top_demand[s] for s in radar_skills]
+        max_demand = max(market_demand) if market_demand else 1
+        market_demand_pct = [round((d / max_demand) * 100) for d in market_demand]
+        
+        # User proficiency (100 if they have it, 0 if not)
+        user_proficiency = []
+        for skill in radar_skills:
+            if skill.lower() in user_skills:
+                user_proficiency.append(85)  # High if user has it
+            else:
+                user_proficiency.append(10)  # Low if missing
+        
+        fig_radar = go.Figure()
+        fig_radar.add_trace(go.Scatterpolar(
+            r=market_demand_pct,
+            theta=radar_skills,
+            fill='toself',
+            name='Market Demand',
+            line=dict(color='#6366f1'),
+            fillcolor='rgba(99,102,241,0.15)',
+        ))
+        fig_radar.add_trace(go.Scatterpolar(
+            r=user_proficiency,
+            theta=radar_skills,
+            fill='toself',
+            name='Your Skills',
+            line=dict(color='#10b981'),
+            fillcolor='rgba(16,185,129,0.15)',
+        ))
+        fig_radar.update_layout(
+            polar=dict(
+                bgcolor='rgba(0,0,0,0)',
+                radialaxis=dict(visible=True, range=[0, 100], gridcolor='rgba(255,255,255,0.1)'),
+                angularaxis=dict(gridcolor='rgba(255,255,255,0.1)'),
+            ),
+            plot_bgcolor='rgba(0,0,0,0)',
+            paper_bgcolor='rgba(0,0,0,0)',
+            font=dict(color='white'),
+            height=450,
+            margin=dict(l=60, r=60, t=30, b=30),
+            legend=dict(orientation="h", yanchor="bottom", y=-0.15, xanchor="center", x=0.5),
+        )
+        st.plotly_chart(fig_radar, use_container_width=True)
+        
+        # Personalized recommendations
+        gaps = [s for s in radar_skills if s.lower() not in user_skills]
+        if gaps:
+            st.markdown("#### 💡 Recommended Skills to Learn")
+            rec_cols = st.columns(min(len(gaps), 3))
+            for i, skill in enumerate(gaps[:3]):
+                demand_pct = round((skill_counts.get(skill, 0) / len(all_jobs)) * 100) if all_jobs else 0
+                with rec_cols[i]:
+                    st.markdown(f"""
+                    <div style="background: linear-gradient(135deg, rgba(239,68,68,0.1) 0%, rgba(239,68,68,0.05) 100%); 
+                                border-radius: 12px; padding: 1.2rem; border: 1px solid rgba(239,68,68,0.2);">
+                        <h4 style="margin: 0 0 0.5rem 0; color: #ef4444;">🚀 {skill}</h4>
+                        <p style="margin: 0; font-size: 0.9rem; color: rgba(255,255,255,0.7);">
+                            Appears in <strong>{demand_pct}%</strong> of job listings.<br>
+                            Learning this skill could significantly improve your match scores.
+                        </p>
+                    </div>
+                    """, unsafe_allow_html=True)
+        else:
+            st.success("🎉 Amazing! You have all the top in-demand skills. You're in great shape!")
+    else:
+        st.markdown("""
+        <div style="background: rgba(255,255,255,0.03); border-radius: 16px; padding: 2.5rem; text-align: center;">
+            <p style="font-size: 3rem; margin: 0;">📄</p>
+            <h3 style="color: rgba(255,255,255,0.8); margin-top: 0.5rem;">Upload Your Resume to Unlock Insights</h3>
+            <p style="color: rgba(255,255,255,0.5);">
+                Go to the <strong>Job Matching</strong> page and upload your resume. 
+                We'll analyze your skills against the market and show you exactly where to focus.
+            </p>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    st.divider()
+    
+    # ============ SECTION 7: MATCHED JOBS TABLE ============
+    if matched_jobs:
+        st.markdown("### 📋 Your Matched Jobs Ranked")
+        
+        job_data = []
+        for j in matched_jobs:
+            score = j.get("match_score", 0)
+            score = score * 100 if score <= 1 else score
+            job_data.append({
+                "Title": j.get("title", "Unknown"),
+                "Company": j.get("company", "Unknown"),
+                "Score": f"{score:.0f}%",
+                "Missing Skills": ", ".join(j.get("missing_skills", [])) or "None",
+                "Source": j.get("source", "LinkedIn"),
+            })
+        
+        df_jobs = pd.DataFrame(job_data)
+        df_jobs = df_jobs.sort_values(by="Score", ascending=False)
+        st.dataframe(df_jobs, use_container_width=True, hide_index=True)
 
 
 def show_settings():

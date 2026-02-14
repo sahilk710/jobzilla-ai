@@ -168,6 +168,19 @@ async def run_agent_pipeline(
     # Build result
     processing_time = time.time() - start_time
     
+    # Convert SkillGap objects to dicts if needed
+    skill_gaps_raw = final_state.get("skill_gaps", [])
+    skill_gaps_dicts = []
+    for sg in skill_gaps_raw:
+        if isinstance(sg, dict):
+            skill_gaps_dicts.append(sg)
+        elif hasattr(sg, "model_dump"):
+            skill_gaps_dicts.append(sg.model_dump())
+        elif hasattr(sg, "dict"):
+            skill_gaps_dicts.append(sg.dict())
+        else:
+            skill_gaps_dicts.append({"skill_name": str(sg)})
+    
     return AgentPipelineResult(
         resume_summary=final_state.get("parsed_experience_summary", resume.summary or ""),
         job_summary=f"{job.title} at {job.company}",
@@ -185,7 +198,7 @@ async def run_agent_pipeline(
             ),
             confidence=0,
         ),
-        skill_gaps=final_state.get("skill_gaps", []),
+        skill_gaps=skill_gaps_dicts,
         cover_letter=final_state.get("cover_letter"),
         improvement_suggestions=final_state.get("improvement_suggestions", []),
         processing_time_seconds=processing_time,

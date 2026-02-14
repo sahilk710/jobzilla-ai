@@ -24,14 +24,20 @@ GITHUB_MCP_URL = os.getenv("MCP_GITHUB_SERVER_URL", "http://mcp-github:8001")
 
 router = APIRouter()
 
-# Initialize clients
+# Initialize clients (safe - won't crash if keys are missing)
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 PINECONE_INDEX = os.getenv("PINECONE_INDEX_NAME", "killmatch-jobs")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-pc = Pinecone(api_key=PINECONE_API_KEY)
-index = pc.Index(PINECONE_INDEX)
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
+try:
+    pc = Pinecone(api_key=PINECONE_API_KEY)
+    index = pc.Index(PINECONE_INDEX)
+except Exception as e:
+    print(f"⚠️ Pinecone init failed (will use fallback): {e}")
+    pc = None
+    index = None
+
+openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 
 def get_embedding(text: str) -> List[float]:
@@ -109,30 +115,37 @@ async def match_jobs(
             
             content = await resume.read()
             
-            # Upload to S3 for persistent storage
+            # Upload to S3 for persistent storage (non-critical, skip on failure)
             user_id = str(uuid.uuid4())[:8]  # Generate temporary user ID
-            s3_result = await upload_resume(
-                user_id=user_id,
-                file_content=content,
-                filename=resume.filename,
-                content_type="application/pdf"
-            )
-            if s3_result.get("success"):
-                print(f"✅ Resume uploaded to S3: {s3_result.get('s3_key')}")
-            else:
-                print(f"⚠️ S3 upload failed (continuing without): {s3_result.get('error', 'Unknown error')}")
+            try:
+                s3_result = await upload_resume(
+                    user_id=user_id,
+                    file_content=content,
+                    filename=resume.filename,
+                    content_type="application/pdf"
+                )
+                if s3_result.get("success"):
+                    print(f"✅ Resume uploaded to S3: {s3_result.get('s3_key')}")
+                else:
+                    print(f"⚠️ S3 upload failed (continuing without): {s3_result.get('error', 'Unknown error')}")
+            except Exception as s3_err:
+                print(f"⚠️ S3 unavailable (continuing without): {s3_err}")
+                s3_result = {"success": False}
             
             # Use our existing service to parse (returns ResumeData model)
             resume_data = await parse_resume(content)
             
-            # Upload parsed data to S3 as well
+            # Upload parsed data to S3 as well (non-critical)
             if s3_result.get("success"):
-                parsed_s3 = await upload_parsed_resume(
-                    user_id=user_id,
-                    parsed_data=resume_data.model_dump() if hasattr(resume_data, 'model_dump') else {}
-                )
-                if parsed_s3.get("success"):
-                    print(f"✅ Parsed resume saved to S3: {parsed_s3.get('s3_key')}")
+                try:
+                    parsed_s3 = await upload_parsed_resume(
+                        user_id=user_id,
+                        parsed_data=resume_data.model_dump() if hasattr(resume_data, 'model_dump') else {}
+                    )
+                    if parsed_s3.get("success"):
+                        print(f"✅ Parsed resume saved to S3: {parsed_s3.get('s3_key')}")
+                except Exception as s3_err:
+                    print(f"⚠️ S3 parsed upload failed (continuing): {s3_err}")
             
             # Extract text for embedding - skills are Skill objects, extract names
             skill_names = [s.name if hasattr(s, 'name') else str(s) for s in (resume_data.skills or [])]
@@ -180,55 +193,92 @@ async def match_jobs(
         # Get embedding vector
         query_vector = get_embedding(search_context)
         
-        # 3. Query Pinecone
-        search_results = index.query(
-            vector=query_vector,
-            top_k=10,
-            include_metadata=True
-        )
-        
+        # 3. Query Pinecone (with database fallback if Pinecone is unreachable)
         matches = []
-        for match in search_results.matches:
-            # Extract job data from metadata
-            metadata = match.metadata or {}
+        try:
+            if index is None:
+                raise Exception("Pinecone not initialized")
             
-            # Basic validation to ensure we have required fields
-            if not metadata.get("title"):
-                continue
+            search_results = index.query(
+                vector=query_vector,
+                top_k=10,
+                include_metadata=True
+            )
             
-            job_description = metadata.get("description", "") or ""
-            job_title = metadata.get("title", "")
-            
-            # Use LLM to extract required skills from job (dynamic, not hardcoded)
-            # Combine title and description for better extraction
-            full_job_text = f"{job_title}\n\n{job_description}"
-            job_skills = set(extract_skills_with_llm(full_job_text, max_skills=10))
-            
-            # Get user's skills (already strings)
-            resume_skills_lower = set(s.lower() for s in skills if s)
-            job_skills_lower = set(s.lower() for s in job_skills if s)
-            
-            # Calculate gaps (case-insensitive comparison)
-            missing_skills_lower = job_skills_lower - resume_skills_lower
-            
-            # Get original casing for display
-            missing_skills = [s for s in job_skills if s.lower() in missing_skills_lower][:5]
+            for match in search_results.matches:
+                metadata = match.metadata or {}
                 
-            job_match = {
-                "id": str(metadata.get("job_id", match.id)),
-                "title": metadata.get("title", "Unknown Role"),
-                "company": metadata.get("company", "Unknown Company"),
-                "description": job_description,
-                "url": metadata.get("url", ""),
-                "source": metadata.get("source", "LinkedIn"),
-                "match_score": match.score,  # Cosine similarity (0-1)
-                "recruiter_concerns": [], 
-                "coach_highlights": [],
-                "missing_skills": missing_skills, 
-            }
-            matches.append(job_match)
+                if not metadata.get("title"):
+                    continue
+                
+                job_description = metadata.get("description", "") or ""
+                job_title = metadata.get("title", "")
+                
+                full_job_text = f"{job_title}\n\n{job_description}"
+                job_skills = set(extract_skills_with_llm(full_job_text, max_skills=10))
+                
+                resume_skills_lower = set(s.lower() for s in skills if s)
+                job_skills_lower = set(s.lower() for s in job_skills if s)
+                
+                missing_skills_lower = job_skills_lower - resume_skills_lower
+                missing_skills = [s for s in job_skills if s.lower() in missing_skills_lower][:5]
+                    
+                job_match = {
+                    "id": str(metadata.get("job_id", match.id)),
+                    "title": metadata.get("title", "Unknown Role"),
+                    "company": metadata.get("company", "Unknown Company"),
+                    "description": job_description,
+                    "url": metadata.get("url", ""),
+                    "source": metadata.get("source", "LinkedIn"),
+                    "match_score": match.score,
+                    "recruiter_concerns": [], 
+                    "coach_highlights": [],
+                    "missing_skills": missing_skills, 
+                }
+                matches.append(job_match)
             
-        return {"matches": matches, "count": len(matches)}
+            print(f"✅ Pinecone returned {len(matches)} matches")
+            
+        except Exception as pinecone_err:
+            print(f"⚠️ Pinecone query failed (falling back to database): {pinecone_err}")
+            
+            # Fallback: query PostgreSQL database directly
+            try:
+                from sqlalchemy import create_engine, text as sql_text
+                db_url = os.getenv("DATABASE_URL", "postgresql+psycopg2://postgres:postgres@postgres:5432/killmatch")
+                engine = create_engine(db_url)
+                
+                search_terms = (query or "software engineer").split()
+                like_clauses = " OR ".join([f"LOWER(title) LIKE :term{i} OR LOWER(description) LIKE :term{i}" for i in range(len(search_terms))])
+                params = {f"term{i}": f"%{term.lower()}%" for i, term in enumerate(search_terms)}
+                
+                with engine.connect() as conn:
+                    result = conn.execute(
+                        sql_text(f"SELECT id, title, company, description, source_platform FROM jobs WHERE ({like_clauses}) AND is_active = true LIMIT 10"),
+                        params
+                    )
+                    
+                    for row in result:
+                        job_match = {
+                            "id": str(row[0]),
+                            "title": row[1] or "Unknown Role",
+                            "company": row[2] or "Unknown Company",
+                            "description": row[3] or "",
+                            "url": "",
+                            "source": row[4] or "Database",
+                            "match_score": 0.75,
+                            "recruiter_concerns": [],
+                            "coach_highlights": [],
+                            "missing_skills": [],
+                        }
+                        matches.append(job_match)
+                
+                print(f"✅ Database fallback returned {len(matches)} matches")
+                
+            except Exception as db_err:
+                print(f"⚠️ Database fallback also failed: {db_err}")
+        
+        return {"matches": matches, "count": len(matches), "parsed_skills": [s for s in skills if s]}
         
     except Exception as e:
         print(f"Error in match_jobs: {str(e)}")

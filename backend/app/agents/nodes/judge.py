@@ -82,6 +82,9 @@ async def judge_node(state: AgentState) -> Dict[str, Any]:
             must_address = data.get("must_address", [])
             nice_to_have = data.get("nice_to_have", [])
             confidence = float(data.get("confidence", 0.7))
+            # LLM may return confidence as percentage (0-100) instead of decimal (0-1)
+            if confidence > 1:
+                confidence = confidence / 100.0
             
         except (json.JSONDecodeError, KeyError, ValueError):
             deciding_factors = []

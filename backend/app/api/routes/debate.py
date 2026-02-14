@@ -64,7 +64,7 @@ async def run_agent_debate(request: DebateRequest):
             name="Candidate",
             summary=request.resume_summary,
             skills=[Skill(name=s, category="Technology") for s in request.resume_skills],
-            experiences=[],
+            experience=[],
             education=[],
             projects=[],
             certifications=[],
@@ -78,12 +78,12 @@ async def run_agent_debate(request: DebateRequest):
             description=request.job_description,
             required_skills=request.job_required_skills,
             preferred_skills=request.job_preferred_skills,
-            salary_range=None,
-            location=None,
-            job_type=None,
-            remote_type=None,
+            salary=None,
+            location="Remote",
+            job_type="Full-time",
+            remote_policy="Remote",
             posted_date=None,
-            source_url=None,
+            source_url="",
         )
         
         # Run the LangGraph pipeline
@@ -122,8 +122,15 @@ async def run_agent_debate(request: DebateRequest):
                 ],
             })
         
-        # Extract skill gaps
-        skill_gap_names = [sg.skill_name for sg in (result.skill_gaps or [])]
+        # Extract skill gaps (handle both SkillGap objects and dicts)
+        skill_gap_names = []
+        for sg in (result.skill_gaps or []):
+            if isinstance(sg, dict):
+                skill_gap_names.append(sg.get("skill_name", str(sg)))
+            elif hasattr(sg, "skill_name"):
+                skill_gap_names.append(sg.skill_name)
+            else:
+                skill_gap_names.append(str(sg))
         
         return SimpleDebateResult(
             total_rounds=result.total_rounds,
