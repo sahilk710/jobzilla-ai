@@ -63,3 +63,4 @@ airflow/*.log
 backend/data/
 postgres_data/
 redis_data/
+db_dumps/
